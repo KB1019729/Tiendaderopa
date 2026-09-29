@@ -1,7 +1,11 @@
 import {
   collection,
   doc,
+  getDoc,
+  setDoc,
   query,
+  where,
+  limit,
   orderBy,
   onSnapshot,
   runTransaction,
@@ -12,11 +16,14 @@ import { db } from "./firebase";
 // Misma estructura de datos que yucaconsuero2:
 // products: { name, description, price, stock, category, imageUrl, storagePath, active, size?, color?, createdAt, updatedAt }
 // combos (aquí = outfits/sets): { name, description, price, stock, imageUrl, storagePath, active, items: [{productId, qty}], createdAt, updatedAt }
-// orders: { items: [{kind:'product'|'combo', refId, name, price, qty, components?}], total, count, note, status, createdAt }
+// orders: { items: [{kind:'product'|'combo', refId, name, price, qty, components?}], total, count, note, status, userId?, userEmail?, userName?, createdAt }
+// carts: doc id = uid → { items: { "kind:id": qty }, updatedAt }
+// users: doc id = uid → { email, name, photoURL, role: 'admin'|'user', loginCount, lastLogin, ... }
 
 export const PRODUCTS_COL = "products";
 export const COMBOS_COL = "combos";
 export const ORDERS_COL = "orders";
+export const CARTS_COL = "carts";
 
 export function subscribeProducts(cb, onError) {
   const q = query(collection(db, PRODUCTS_COL), orderBy("createdAt", "desc"));
@@ -36,8 +43,36 @@ export function subscribeCombos(cb, onError) {
   );
 }
 
+// ---------- Carrito por usuario (loguado) ----------
+// Invitados usan localStorage; logueados persisten en `carts/{uid}`.
+export async function getCart(uid) {
+  if (!uid) return {};
+  const snap = await getDoc(doc(db, CARTS_COL, uid));
+  const items = snap.exists() ? snap.data().items : null;
+  return items && typeof items === "object" ? items : {};
+}
+
+export async function saveCart(uid, items) {
+  if (!uid) return;
+  await setDoc(
+    doc(db, CARTS_COL, uid),
+    { items: items || {}, updatedAt: serverTimestamp() },
+    { merge: true }
+  );
+}
+
+export async function clearCart(uid) {
+  if (!uid) return;
+  await setDoc(
+    doc(db, CARTS_COL, uid),
+    { items: {}, updatedAt: serverTimestamp() },
+    { merge: true }
+  );
+}
+
 // Misma transacción atómica de yucaconsuero2: descuenta stock y crea la orden.
-export async function createSale(cart, note = "") {
+// meta: { userId, userEmail, userName } para tracking de quién compró.
+export async function createSale(cart, note = "", meta = {}) {
   const clean = (cart || [])
     .filter((i) => i && i.refId && Number(i.qty) > 0)
     .map((i) => ({
@@ -136,6 +171,9 @@ export async function createSale(cart, note = "") {
       count,
       note: (note || "").trim(),
       status: "completed",
+      userId: meta.userId || null,
+      userEmail: meta.userEmail || "",
+      userName: meta.userName || "",
       createdAt: serverTimestamp(),
     });
   });
@@ -143,4 +181,29 @@ export async function createSale(cart, note = "") {
 
 export function money(n) {
   return `$${(Number(n) || 0).toFixed(2)}`;
+}
+
+/** Escucha en vivo una orden PayU por su referencia (página de resultado). */
+export function subscribeOrderByReference(reference, cb, onError) {
+  const ref = String(reference || "").trim();
+  if (!ref) {
+    cb(null);
+    return () => {};
+  }
+  const q = query(
+    collection(db, ORDERS_COL),
+    where("referenceCode", "==", ref),
+    limit(1)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      if (snap.empty) cb(null);
+      else {
+        const d = snap.docs[0];
+        cb({ id: d.id, ...d.data() });
+      }
+    },
+    onError
+  );
 }
