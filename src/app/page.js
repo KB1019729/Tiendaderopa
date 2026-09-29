@@ -4,9 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import {
   subscribeProducts,
   subscribeCombos,
-  createSale,
+  getCart,
+  saveCart,
+  clearCart,
   money,
 } from "@/lib/shop";
+import { useAuth, signInWithGoogle, signOutUser } from "@/lib/auth";
 
 const SIZES = ["XS", "S", "M", "L", "XL", "XXL"];
 const SORTS = [
@@ -48,10 +51,21 @@ export default function TiendaRopa() {
   const [quickView, setQuickView] = useState(null); // {kind, item}
   const [quickQty, setQuickQty] = useState(1);
   const [note, setNote] = useState("");
+  const [buyerEmail, setBuyerEmail] = useState("");
   const [buying, setBuying] = useState(false);
   const [cartError, setCartError] = useState("");
-  const [orderOk, setOrderOk] = useState(null); // {total, count}
   const [toast, setToast] = useState("");
+  const [userMenu, setUserMenu] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [cartHydrated, setCartHydrated] = useState(false);
+
+  // ---------- Auth + rol ----------
+  const { user, profile } = useAuth();
+
+  // Prellenar email de compra con el de la cuenta
+  useEffect(() => {
+    if (user?.email) setBuyerEmail((prev) => prev || user.email);
+  }, [user]);
 
   useEffect(() => {
     const offP = subscribeProducts(
@@ -80,6 +94,90 @@ export default function TiendaRopa() {
   function flash(msg) {
     setToast(msg);
     setTimeout(() => setToast(""), 2600);
+  }
+
+  // ---------- Carrito: invitado en localStorage, logueado en Firestore ----------
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("vesta-cart");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") setCart(parsed);
+      }
+    } catch {
+      // ignorar
+    }
+    setCartHydrated(true);
+  }, []);
+
+  // Invitado: persistir en localStorage
+  useEffect(() => {
+    if (!cartHydrated || user) return;
+    try {
+      localStorage.setItem("vesta-cart", JSON.stringify(cart));
+    } catch {
+      // ignorar
+    }
+  }, [cart, user, cartHydrated]);
+
+  // Al entrar: fusionar carrito local con el guardado en la cuenta
+  useEffect(() => {
+    if (!user || !cartHydrated) return;
+    let alive = true;
+    (async () => {
+      try {
+        const remote = await getCart(user.uid);
+        if (!alive) return;
+        const merged = { ...remote };
+        for (const [k, q] of Object.entries(cart)) {
+          if (Number(q) > 0) merged[k] = (Number(merged[k]) || 0) + Number(q);
+        }
+        Object.keys(merged).forEach((k) => {
+          if (!merged[k]) delete merged[k];
+        });
+        setCart(merged);
+        await saveCart(user.uid, merged);
+      } catch (e) {
+        console.error(e);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // solo al iniciar sesión (el carrito invitado se fusiona una vez)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  // Logueado: guardar cada cambio (debounce)
+  useEffect(() => {
+    if (!user || !cartHydrated) return;
+    const t = setTimeout(() => {
+      saveCart(user.uid, cart).catch(console.error);
+    }, 800);
+    return () => clearTimeout(t);
+  }, [cart, user, cartHydrated]);
+
+  async function handleLogin() {
+    setAuthBusy(true);
+    try {
+      await signInWithGoogle();
+      setUserMenu(false);
+    } catch (e) {
+      console.error(e);
+      if (e?.code !== "auth/popup-closed-by-user") flash("No se pudo entrar con Google");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await signOutUser();
+      setUserMenu(false);
+      flash("Sesión cerrada");
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   const visibleProducts = useMemo(
@@ -199,20 +297,61 @@ export default function TiendaRopa() {
     });
   }
 
+  /** Redirige al checkout de Mercado Pago. */
+  function redirectToMP(initPoint) {
+    window.location.href = initPoint;
+  }
+
+  // Checkout con Mercado Pago: crea preferencia y redirige al checkout.
   async function checkout(e) {
     e?.preventDefault();
     setCartError("");
     if (lines.length === 0) return setCartError("Tu carrito está vacío.");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(buyerEmail.trim())) {
+      return setCartError("Escribe un email válido para el pago.");
+    }
     setBuying(true);
     try {
-      await createSale(lines, note);
-      setOrderOk({ total, count });
+      let idToken = null;
+      try {
+        if (user) idToken = await user.getIdToken();
+      } catch {
+        idToken = null;
+      }
+      const res = await fetch("/api/mercadopago/preference", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: lines.map((l) => ({ kind: l.kind, refId: l.refId, qty: l.qty })),
+          email: buyerEmail.trim(),
+          note,
+          idToken,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || "No se pudo iniciar el pago.");
+      }
+      // La orden ya quedó guardada como pending: vaciar carrito y salir a MP.
       setCart({});
+      if (user) {
+        try {
+          await clearCart(user.uid);
+        } catch {
+          // ignorar
+        }
+      } else {
+        try {
+          localStorage.removeItem("vesta-cart");
+        } catch {
+          // ignorar
+        }
+      }
       setNote("");
-      setCartOpen(false);
+      redirectToMP(data.initPoint);
     } catch (err) {
       console.error(err);
-      setCartError(err?.message || "No se pudo completar la compra.");
+      setCartError(err?.message || "No se pudo iniciar el pago con Mercado Pago.");
     } finally {
       setBuying(false);
     }
@@ -271,6 +410,66 @@ export default function TiendaRopa() {
             <span className="hidden rounded-full border border-stone-200 bg-white px-3 py-1.5 font-mono text-[11px] text-stone-500 sm:block">
               {visibleProducts.length} prendas · {visibleCombos.length} outfits
             </span>
+            {!user ? (
+              <button
+                onClick={handleLogin}
+                disabled={authBusy}
+                className="rounded-full border border-stone-200 bg-white px-4 py-2.5 text-sm font-bold hover:border-stone-900 disabled:opacity-60"
+              >
+                {authBusy ? "..." : "○ Entrar"}
+              </button>
+            ) : (
+              <div className="relative">
+                <button
+                  onClick={() => setUserMenu(!userMenu)}
+                  className="flex items-center gap-2 rounded-full border border-stone-200 bg-white py-1 pl-1 pr-3 hover:border-stone-900"
+                  title={user.email}
+                >
+                  {user.photoURL ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={user.photoURL} alt="" className="h-8 w-8 rounded-full object-cover" />
+                  ) : (
+                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-stone-900 font-bold text-white">
+                      {(user.displayName || user.email || "?").slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                  <span className="hidden max-w-24 truncate text-sm font-bold sm:block">
+                    {(user.displayName || "Mi cuenta").split(" ")[0]}
+                  </span>
+                </button>
+                {userMenu && (
+                  <div className="card-shop absolute right-0 top-12 z-50 w-60 rounded-2xl p-4">
+                    <p className="truncate text-sm font-bold">{user.displayName || "Mi cuenta"}</p>
+                    <p className="truncate font-mono text-[11px] text-stone-500">{user.email}</p>
+                    <p className="mt-2">
+                      <span
+                        className={`rounded-full border px-2.5 py-0.5 font-mono text-[11px] font-bold ${
+                          profile?.role === "admin"
+                            ? "border-amber-300 bg-amber-50 text-amber-700"
+                            : "border-stone-200 bg-stone-50 text-stone-600"
+                        }`}
+                      >
+                        {(profile?.role || "user").toUpperCase()}
+                      </span>
+                    </p>
+                    <p className="mt-2 text-xs text-stone-500">
+                      Tu carrito se guarda en tu cuenta.
+                    </p>
+                    {profile?.role === "admin" && (
+                      <p className="mt-1 font-mono text-[11px] text-amber-700">
+                        Tienes acceso al panel admin.
+                      </p>
+                    )}
+                    <button
+                      onClick={handleLogout}
+                      className="mt-3 w-full rounded-full border border-stone-200 px-3 py-2 text-xs font-bold text-stone-600 hover:border-red-300 hover:text-red-600"
+                    >
+                      Cerrar sesión
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
             <button
               onClick={() => setCartOpen(true)}
               className="btn-shop relative rounded-full px-5 py-2.5 text-sm font-bold"
@@ -745,7 +944,9 @@ export default function TiendaRopa() {
                 <br />
                 combos: name, price, stock, items[]
                 <br />
-                orders: items[], total, status
+                orders: items[], total, status, userId
+                <br />
+                users: email, role, loginCount · carts por uid
               </p>
             </div>
             <div>
@@ -900,7 +1101,9 @@ export default function TiendaRopa() {
                   Tu carrito ({count})
                 </h3>
                 <p className="text-xs text-stone-500">
-                  El stock se valida al pagar
+                  {user
+                    ? `Guardado en tu cuenta · ${user.email}`
+                    : "Invitado · entra para guardarlo en tu cuenta"}
                 </p>
               </div>
               <button
@@ -993,10 +1196,18 @@ export default function TiendaRopa() {
                 className="border-t border-stone-200 bg-white p-5"
               >
                 <input
+                  type="email"
+                  required
+                  value={buyerEmail}
+                  onChange={(e) => setBuyerEmail(e.target.value)}
+                  placeholder="Email para el pago *"
+                  className="input-shop w-full rounded-xl px-4 py-2.5 text-sm"
+                />
+                <input
                   value={note}
                   onChange={(e) => setNote(e.target.value)}
                   placeholder="Nombre + dirección / nota de entrega (opcional)"
-                  className="input-shop w-full rounded-xl px-4 py-2.5 text-sm"
+                  className="input-shop mt-2 w-full rounded-xl px-4 py-2.5 text-sm"
                 />
                 {cartError && (
                   <p className="mt-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
@@ -1016,40 +1227,14 @@ export default function TiendaRopa() {
                   disabled={buying || lines.length === 0}
                   className="btn-accent mt-3 w-full rounded-full px-4 py-3.5 text-sm font-bold"
                 >
-                  {buying ? "Procesando pago..." : `Pagar ${money(total)}`}
+                  {buying ? "Creando orden..." : `Pagar con Mercado Pago ${money(total)}`}
                 </button>
                 <p className="mt-2 text-center font-mono text-[11px] text-stone-400">
-                  Crea una orden en Firestore · descuenta stock
+                  Serás redirigido al checkout seguro de Mercado Pago
                 </p>
               </form>
             )}
           </aside>
-        </div>
-      )}
-
-      {/* PEDIDO OK */}
-      {orderOk && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-          <div
-            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setOrderOk(null)}
-          />
-          <div className="fade-up relative w-full max-w-sm rounded-3xl bg-white p-8 text-center">
-            <p className="font-serif text-6xl">✓</p>
-            <h3 className="mt-2 font-serif text-2xl font-black">
-              ¡Pedido confirmado!
-            </h3>
-            <p className="mt-2 text-sm text-stone-500">
-              {orderOk.count} prendas · total {money(orderOk.total)}. El
-              inventario ya se actualizó.
-            </p>
-            <button
-              onClick={() => setOrderOk(null)}
-              className="btn-shop mt-5 w-full rounded-full px-4 py-3 text-sm font-bold"
-            >
-              Seguir comprando
-            </button>
-          </div>
         </div>
       )}
 
